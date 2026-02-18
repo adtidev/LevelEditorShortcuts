@@ -1,0 +1,21 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Level Editor Shortcuts",
+	"Description": "Custom shortcuts for level editing: Q/E drag movement, 1-2-3 gizmo switching, transform copy/paste, snap to ground",
+	"Category": "Editor",
+	"CreatedBy": "Adam",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "LevelEditorShortcuts",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}
