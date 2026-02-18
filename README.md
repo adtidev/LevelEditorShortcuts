@@ -2,6 +2,20 @@
 
 Unreal Engine 5 editor plugin that adds keyboard shortcuts for faster level editing: drag-to-move, scroll-to-rotate, snap-to-ground, transform copy/paste, and more.
 
+## What's Included
+
+- **Hold-and-drag movement** — Hold Q to move actors horizontally, E to move vertically. No click needed — just hold the key and drag. Cursor hides and warps for infinite range. Respects local/world coordinate space and grid snap.
+- **Hold-and-drag scaling** — Hold R and drag to scale actors uniformly. Drag right/up to grow, left/down to shrink.
+- **Scroll-to-rotate** — Hold Q and scroll to rotate actors around Z in snap increments. Hold Shift to ignore rotation snap. Groups rotate around their shared center.
+- **Quick gizmo switching** — 1/2/3 for Move/Rotate/Scale (disabled in Landscape/Foliage modes where number keys do other things). Works in Level Editor only — Blueprint editor keeps default W/E/R.
+- **Grid snap controls** — Tap G to toggle grid snap on/off. Hold G and scroll to change grid snap size.
+- **Rotation snap bypass** — Hold Shift while dragging the rotation gizmo to temporarily disable rotation snapping for that drag only.
+- **Transform copy/paste** — Ctrl+C copies the selected actor's transform. Ctrl+T pastes location and rotation to selected actor(s) while preserving their scale.
+- **Duplicate in place** — Ctrl+D duplicates without the default offset that Unreal adds.
+- **Snap to ground** — Ctrl+B snaps to ground and inherits the surface slope rotation. Shift+B snaps to ground but keeps world-up orientation. Both modes use mesh/collision bounds to place the object's bottom on the surface, and skip query-only/overlap colliders.
+- **Paste to folder** — Ctrl+Shift+V pastes clipboard actors into the same World Outliner folder as the currently selected actor.
+- **Full undo support** — All drag operations (Q/E/R) create a single undo transaction, so one Ctrl+Z undoes the entire drag.
+
 ## Installation
 
 1. Download or clone this repo into your project's `Plugins/` folder
