@@ -7,6 +7,7 @@
 // Q+Scroll: Rotate selected actor(s) around Z axis
 // G tap: Toggle grid snapping on/off
 // G+Scroll: Change grid snap size (when not in Landscape/Foliage modes)
+// J tap: Toggle Game View (hide editor shapes/icons/volumes)
 
 #include "CoreMinimal.h"
 #include "Framework/Application/IInputProcessor.h"
@@ -159,10 +160,37 @@ public:
 				return true; // Consume E to prevent any default behavior
 			}
 		}
-		if (Key == EKeys::G)
+		if (Key == EKeys::G && IsLevelEditorViewportFocused())
 		{
 			bGKeyDown = true;
 			bGScrolledWhileDown = false;
+		}
+
+		// J tap: Toggle Game View (hide editor shapes/icons/volumes)
+		if (Key == EKeys::J && !InKeyEvent.IsRepeat())
+		{
+			if (!InKeyEvent.IsControlDown() && !InKeyEvent.IsAltDown() && !InKeyEvent.IsShiftDown())
+			{
+				if (IsLevelEditorViewportFocused())
+				{
+					FLevelEditorViewportClient* ViewportClient = GetActiveViewportClient();
+					if (ViewportClient)
+					{
+						bool bWasGameView = ViewportClient->IsInGameView();
+						ViewportClient->SetGameView(!bWasGameView);
+
+						// SetGameView calls ShowWidget(false) on enter but never
+						// restores it on exit — force it back on
+						if (bWasGameView)
+						{
+							ViewportClient->ShowWidget(true);
+						}
+
+						ViewportClient->Invalidate();
+						return true;
+					}
+				}
+			}
 		}
 
 		// R+Drag: Uniform scale (Level Editor only)
@@ -190,33 +218,26 @@ public:
 			}
 		}
 
-		// 1-2-3 for widget modes (Move, Rotate, Scale) - only without modifiers
-		// Only works in Level Editor viewport - Blueprint editor doesn't expose mode tools safely
+		// 1-2-3 for widget modes (Move, Rotate, Scale) - only in Level Editor viewport, without modifiers
 		if (!InKeyEvent.IsControlDown() && !InKeyEvent.IsAltDown() && !InKeyEvent.IsShiftDown())
 		{
 			// Don't intercept in Landscape/Foliage modes (they use 1-9 for tools)
-			if (!bInLandscapeMode && !bInFoliageMode)
+			if (!bInLandscapeMode && !bInFoliageMode && IsLevelEditorViewportFocused())
 			{
 				if (Key == EKeys::One)
 				{
-					if (SetWidgetModeOnActiveViewport(UE::Widget::WM_Translate))
-					{
-						return true;
-					}
+					GLevelEditorModeTools().SetWidgetMode(UE::Widget::WM_Translate);
+					return true;
 				}
 				if (Key == EKeys::Two)
 				{
-					if (SetWidgetModeOnActiveViewport(UE::Widget::WM_Rotate))
-					{
-						return true;
-					}
+					GLevelEditorModeTools().SetWidgetMode(UE::Widget::WM_Rotate);
+					return true;
 				}
 				if (Key == EKeys::Three)
 				{
-					if (SetWidgetModeOnActiveViewport(UE::Widget::WM_Scale))
-					{
-						return true;
-					}
+					GLevelEditorModeTools().SetWidgetMode(UE::Widget::WM_Scale);
+					return true;
 				}
 			}
 		}
@@ -232,7 +253,7 @@ public:
 			return false;
 		}
 
-		if (InKeyEvent.GetKey() == EKeys::Q)
+		if (InKeyEvent.GetKey() == EKeys::Q && bQKeyDown)
 		{
 			// If we rotated with Q+scroll, restore the move gizmo
 			if (bQScrolledWhileDown)
@@ -251,7 +272,7 @@ public:
 			}
 			return true;
 		}
-		if (InKeyEvent.GetKey() == EKeys::E)
+		if (InKeyEvent.GetKey() == EKeys::E && bEKeyDown)
 		{
 			bEKeyDown = false;
 			EndDragTransaction();
@@ -264,7 +285,7 @@ public:
 			}
 			return true;
 		}
-		if (InKeyEvent.GetKey() == EKeys::R)
+		if (InKeyEvent.GetKey() == EKeys::R && bRKeyDown)
 		{
 			bRKeyDown = false;
 			EndDragTransaction();
@@ -463,39 +484,6 @@ private:
 		{
 			return ActiveViewport->HasKeyboardFocus() || ActiveViewport->HasFocusedDescendants();
 		}
-		return false;
-	}
-
-	// Set widget mode on the currently active editor viewport
-	bool SetWidgetModeOnActiveViewport(UE::Widget::EWidgetMode Mode)
-	{
-		// First, check if Level Editor viewport is focused - use GLevelEditorModeTools
-		if (IsLevelEditorViewportFocused())
-		{
-			GLevelEditorModeTools().SetWidgetMode(Mode);
-			return true;
-		}
-
-		// Try GEditor->GetActiveViewport() for other editor viewports (Blueprint, Static Mesh, etc.)
-		FViewport* ActiveViewport = GEditor ? GEditor->GetActiveViewport() : nullptr;
-		if (ActiveViewport)
-		{
-			FViewportClient* Client = ActiveViewport->GetClient();
-			if (Client)
-			{
-				FEditorViewportClient* EditorClient = static_cast<FEditorViewportClient*>(Client);
-				if (EditorClient)
-				{
-					FEditorModeTools* ModeTools = EditorClient->GetModeTools();
-					if (ModeTools)
-					{
-						ModeTools->SetWidgetMode(Mode);
-						return true;
-					}
-				}
-			}
-		}
-
 		return false;
 	}
 
@@ -984,8 +972,8 @@ private:
 			return;
 		}
 
-		// Create undo transaction
-		FScopedTransaction Transaction(FText::FromString(TEXT("Rotate Selected")));
+		// Use shared drag transaction so entire Q+scroll session is one undo
+		EnsureDragTransaction(FText::FromString(TEXT("Rotate Selected")));
 
 		// Determine pivot point for rotation
 		// If grouped or multiple selection, rotate around the center
