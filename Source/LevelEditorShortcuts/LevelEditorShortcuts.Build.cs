@@ -20,7 +20,10 @@ public class LevelEditorShortcuts : ModuleRules
 		{
 			"UnrealEd",
 			"EditorFramework",
-			"LevelEditor"
+			"LevelEditor",
+			"WorkspaceMenuStructure",
+			"ToolMenus",
+			"Projects"
 		});
 	}
 }

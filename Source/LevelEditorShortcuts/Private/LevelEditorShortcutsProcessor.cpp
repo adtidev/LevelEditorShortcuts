@@ -218,6 +218,18 @@ public:
 			}
 		}
 
+		// Shift+4 — toggle/invoke the Lock Browser tab (works from anywhere in editor).
+		if (Key == EKeys::Four
+			&& InKeyEvent.IsShiftDown()
+			&& !InKeyEvent.IsControlDown()
+			&& !InKeyEvent.IsAltDown()
+			&& !InKeyEvent.IsRepeat())
+		{
+			extern void LockBrowser_Toggle();  // forward decl, defined below
+			LockBrowser_Toggle();
+			return true;
+		}
+
 		// 1-2-3 for widget modes (Move, Rotate, Scale) - only in Level Editor viewport, without modifiers
 		if (!InKeyEvent.IsControlDown() && !InKeyEvent.IsAltDown() && !InKeyEvent.IsShiftDown())
 		{
@@ -1077,3 +1089,7 @@ namespace LevelEditorShortcuts
 	void Register() { FLevelEditorShortcutsProcessor::Register(); }
 	void Unregister() { FLevelEditorShortcutsProcessor::Unregister(); }
 }
+
+// Shim used by the input processor to toggle the Lock Browser tab via Shift+4.
+namespace LockBrowser { void Toggle(); }
+void LockBrowser_Toggle() { LockBrowser::Toggle(); }
