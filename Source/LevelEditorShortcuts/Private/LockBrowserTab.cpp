@@ -33,6 +33,8 @@
 #include "Misc/Paths.h"
 #include "Misc/Parse.h"
 #include "Misc/App.h"
+#include "Misc/ConfigCacheIni.h"
+#include "HAL/PlatformProperties.h"
 #include "Internationalization/Text.h"
 
 #define LOCTEXT_NAMESPACE "LockBrowser"
@@ -54,6 +56,45 @@ namespace LockBrowser
 		FString ActorClass;
 		bool bIsMine = false;
 	};
+
+	struct FP4Connection
+	{
+		FString Port;
+		FString User;
+		FString Client;
+	};
+
+	/** Read the Perforce connection Unreal's editor SCC is using, from Saved/Config/<Plat>/SourceControlSettings.ini.
+	 *  Returns false if the active provider isn't Perforce. Any individual field may be empty (e.g. when UseP4Config=True). */
+	static bool GetUnrealP4Connection(FP4Connection& Out)
+	{
+		const FString IniPath = FPaths::GeneratedConfigDir()
+			+ ANSI_TO_TCHAR(FPlatformProperties::PlatformName())
+			+ TEXT("/SourceControlSettings.ini");
+
+		FString Provider;
+		GConfig->GetString(TEXT("SourceControl.SourceControlSettings"), TEXT("Provider"), Provider, IniPath);
+		if (!Provider.Equals(TEXT("Perforce"), ESearchCase::IgnoreCase))
+		{
+			return false;
+		}
+
+		GConfig->GetString(TEXT("PerforceSourceControl.PerforceSourceControlSettings"), TEXT("Port"),      Out.Port,   IniPath);
+		GConfig->GetString(TEXT("PerforceSourceControl.PerforceSourceControlSettings"), TEXT("UserName"),  Out.User,   IniPath);
+		GConfig->GetString(TEXT("PerforceSourceControl.PerforceSourceControlSettings"), TEXT("Workspace"), Out.Client, IniPath);
+		return true;
+	}
+
+	/** Builds leading `-p ... -u ... -c ...` flags for shelling out to p4, sourced from Unreal's SCC settings.
+	 *  Empty fields are skipped, letting p4 fall back to its own resolution (env / P4CONFIG / registry). */
+	static FString BuildP4ConnectionFlags(const FP4Connection& Conn)
+	{
+		FString Flags;
+		if (!Conn.Port.IsEmpty())   { Flags += FString::Printf(TEXT("-p \"%s\" "), *Conn.Port); }
+		if (!Conn.User.IsEmpty())   { Flags += FString::Printf(TEXT("-u \"%s\" "), *Conn.User); }
+		if (!Conn.Client.IsEmpty()) { Flags += FString::Printf(TEXT("-c \"%s\" "), *Conn.Client); }
+		return Flags;
+	}
 
 	/** Maps a Perforce depot path under .../Content/ to a UE package name like /Game/Foo/Bar.
 	 *  Returns empty if the path isn't under any Content folder we recognise. */
@@ -109,8 +150,14 @@ namespace LockBrowser
 	{
 		OutEntries.Reset();
 
+		// Pull connection from Unreal's SCC settings so the CLI doesn't fall back to default `perforce:1666`
+		// when a teammate's shell hasn't set P4PORT/P4USER/P4CLIENT.
+		FP4Connection Conn;
+		const bool bHaveSettings = GetUnrealP4Connection(Conn);
+		const FString ConnFlags = bHaveSettings ? BuildP4ConnectionFlags(Conn) : FString();
+
 		// Format pipe-separated so parsing is trivial.
-		const FString Args = TEXT("-F \"%depotFile%|%action%|%user%|%client%\" opened -a");
+		const FString Args = ConnFlags + TEXT("-F \"%depotFile%|%action%|%user%|%client%\" opened -a");
 
 		int32 ReturnCode = -1;
 		FString StdOut;
@@ -123,12 +170,16 @@ namespace LockBrowser
 		}
 
 		// Determine the current p4 user so we can flag rows as "mine".
-		FString MyUser;
+		// Prefer the value from UE's SCC settings (always trustworthy when bHaveSettings is true);
+		// otherwise fall back to `p4 info` to honour env/P4CONFIG.
+		FString MyUser = Conn.User;
+		if (MyUser.IsEmpty())
 		{
 			int32 RC2 = -1;
 			FString Out2;
 			FString Err2;
-			FPlatformProcess::ExecProcess(TEXT("p4"), TEXT("-F \"%userName%\" -ztag info"), &RC2, &Out2, &Err2);
+			const FString InfoArgs = ConnFlags + TEXT("-F \"%userName%\" -ztag info");
+			FPlatformProcess::ExecProcess(TEXT("p4"), *InfoArgs, &RC2, &Out2, &Err2);
 			if (RC2 == 0)
 			{
 				MyUser = Out2.TrimStartAndEnd();
