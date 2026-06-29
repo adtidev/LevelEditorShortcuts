@@ -13,6 +13,7 @@
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SSearchBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SListView.h"
 #include "Widgets/SBoxPanel.h"
@@ -255,6 +256,19 @@ namespace LockBrowser
 							SNew(STextBlock).Text(LOCTEXT("ExternalActorsOnly", "External actors only"))
 						]
 					]
+					+ SHorizontalBox::Slot().AutoWidth().Padding(8.f, 0.f, 2.f, 0.f).VAlign(VAlign_Center)
+					[
+						SNew(SBox).WidthOverride(260.f)
+						[
+							SNew(SSearchBox)
+							.HintText(LOCTEXT("SearchHint", "Filter by actor / user / GUID…"))
+							.OnTextChanged_Lambda([this](const FText& NewText)
+							{
+								SearchText = NewText.ToString();
+								RebuildVisible();
+							})
+						]
+					]
 					+ SHorizontalBox::Slot().FillWidth(1.f).Padding(8.f, 0.f).VAlign(VAlign_Center)
 					[
 						SNew(STextBlock).Text_Lambda([this]() { return StatusText; })
@@ -354,6 +368,8 @@ namespace LockBrowser
 
 		void RebuildVisible()
 		{
+			const FString Needle = SearchText.TrimStartAndEnd();
+			const bool bHaveSearch = !Needle.IsEmpty();
 			VisibleEntries.Reset(AllEntries.Num());
 			for (const TSharedPtr<FLockEntry>& E : AllEntries)
 			{
@@ -368,6 +384,20 @@ namespace LockBrowser
 				if (bExternalActorsOnly && !E->DepotPath.Contains(TEXT("__ExternalActors__")))
 				{
 					continue;
+				}
+				if (bHaveSearch)
+				{
+					const bool bMatch =
+						E->ActorName.Contains(Needle)   ||
+						E->ActorClass.Contains(Needle)  ||
+						E->User.Contains(Needle)        ||
+						E->Action.Contains(Needle)      ||
+						E->DepotPath.Contains(Needle)   ||
+						E->PackageName.Contains(Needle);
+					if (!bMatch)
+					{
+						continue;
+					}
 				}
 				VisibleEntries.Add(E);
 			}
@@ -449,6 +479,7 @@ namespace LockBrowser
 		bool bRefreshing = false;
 		bool bShowOnlyOthers = false;
 		bool bExternalActorsOnly = true;
+		FString SearchText;
 	};
 
 	static TSharedRef<SDockTab> SpawnTab(const FSpawnTabArgs&)

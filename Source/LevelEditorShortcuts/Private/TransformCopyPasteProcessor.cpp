@@ -91,11 +91,11 @@ public:
 			return false;
 		}
 
-		// Ctrl+C - Copy transform (don't consume, let normal copy happen too)
-		if (InKeyEvent.GetKey() == EKeys::C)
+		// Ctrl+C or Ctrl+X - Copy transform (don't consume, let normal copy/cut happen too)
+		if (InKeyEvent.GetKey() == EKeys::C || InKeyEvent.GetKey() == EKeys::X)
 		{
 			CopySelectedTransform();
-			return false; // Don't consume - allow normal Ctrl+C copy to proceed
+			return false; // Don't consume - allow normal Ctrl+C/X to proceed
 		}
 
 		// Ctrl+T - Paste transform
@@ -592,12 +592,14 @@ private:
 		GEditor->Exec(GEditor->GetEditorWorldContext().World(), TEXT("DUPLICATE"));
 
 		// The duplicated actors are now selected - move them back to original positions
+		// Use Min of counts: groups may change selection count after duplication
 		Selection = GEditor->GetSelectedActors();
-		if (Selection && Selection->Num() == OriginalTransforms.Num())
+		if (Selection && Selection->Num() > 0)
 		{
 			FScopedTransaction Transaction(FText::FromString(TEXT("Duplicate In Place")));
 
-			for (int32 i = 0; i < Selection->Num(); i++)
+			const int32 Count = FMath::Min(Selection->Num(), OriginalTransforms.Num());
+			for (int32 i = 0; i < Count; i++)
 			{
 				if (AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i)))
 				{

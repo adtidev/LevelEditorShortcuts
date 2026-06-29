@@ -26,6 +26,8 @@
 #include "UnrealWidget.h"
 #include "SceneView.h"
 #include "Editor/GroupActor.h"
+#include "Editor/UnrealEdEngine.h"
+#include "UnrealEdGlobals.h"  // GUnrealEd
 
 class FLevelEditorShortcutsProcessor : public IInputProcessor
 {
@@ -548,6 +550,43 @@ private:
 		return Count > 0 ? Sum / Count : FVector::ZeroVector;
 	}
 
+	// Move the editor's transform gizmo/pivot along with a translate drag.
+	// We move actors directly via SetActorLocation, which bypasses the native gizmo drag path
+	// that normally keeps the pivot in sync, so the gizmo stays pinned at the group's original
+	// spot while the actors slide away.
+	//
+	// Two cases, per UUnrealEdEngine::UpdatePivotLocationForSelection (EditorSelectUtils.cpp):
+	//   - Plain / multi selection: the pivot is recomputed from the manipulated element's world
+	//     transform. UpdatePivotLocationForSelection() re-reads that and follows the moved actors.
+	//   - LOCKED group: the pivot is forced to AGroupActor::GetActorLocation() (the group ROOT's
+	//     own location), NOT the members' centroid. We move the members but never touch the root,
+	//     so the root stays put and the gizmo stays pinned there. CenterGroupLocation() repositions
+	//     the root to the members' new bounds center (it moves only the root, not the members),
+	//     which is exactly what the engine does after a native group move.
+	void RefreshEditorPivot(USelection* Selection)
+	{
+		TSet<AGroupActor*> LockedRoots;
+		for (int32 i = 0; i < Selection->Num(); i++)
+		{
+			if (AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i)))
+			{
+				if (AGroupActor* Root = AGroupActor::GetRootForActor(Actor, /*bMustBeLocked*/ true))
+				{
+					LockedRoots.Add(Root);
+				}
+			}
+		}
+		for (AGroupActor* Root : LockedRoots)
+		{
+			Root->CenterGroupLocation();
+		}
+
+		if (GUnrealEd)
+		{
+			GUnrealEd->UpdatePivotLocationForSelection();
+		}
+	}
+
 	// Project screen position to world position on a horizontal plane at given Z
 	bool ScreenToWorldOnPlane(FLevelEditorViewportClient* ViewportClient, const FVector2D& ScreenPos, float PlaneZ, FVector& OutWorldPos)
 	{
@@ -597,6 +636,48 @@ private:
 
 		OutWorldPos = WorldOrigin + WorldDirection * T;
 		return true;
+	}
+
+	// Build the list of actors a translate/rotate drag should transform directly.
+	// Skips any actor whose attachment ancestor is also selected: that ancestor's transform already
+	// carries this actor via attachment, so transforming it again would double-apply and scatter it
+	// out of formation (the classic "grouped objects fly apart" bug). Also skips the AGroupActor
+	// container itself — it's a passive holder with no geometry, and the native transform never
+	// moves it directly (it recenters from its members). Pure Ctrl+G groups with no attachments are
+	// unaffected: none of their members has a selected parent, so all are kept.
+	void GetActorsToTransform(USelection* Selection, TArray<AActor*>& OutActors) const
+	{
+		TSet<AActor*> SelectedSet;
+		for (int32 i = 0; i < Selection->Num(); i++)
+		{
+			if (AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i)))
+			{
+				SelectedSet.Add(Actor);
+			}
+		}
+
+		for (AActor* Actor : SelectedSet)
+		{
+			if (Actor->IsA(AGroupActor::StaticClass()))
+			{
+				continue;
+			}
+
+			bool bAncestorSelected = false;
+			for (AActor* Parent = Actor->GetAttachParentActor(); Parent; Parent = Parent->GetAttachParentActor())
+			{
+				if (SelectedSet.Contains(Parent))
+				{
+					bAncestorSelected = true;
+					break;
+				}
+			}
+
+			if (!bAncestorSelected)
+			{
+				OutActors.Add(Actor);
+			}
+		}
 	}
 
 	void MoveSelectedActorsHorizontal(const FVector2D& MouseDelta)
@@ -716,19 +797,19 @@ private:
 			AccumulatedMovement = FVector::ZeroVector;
 		}
 
-		// Apply movement to all selected actors
-		for (int32 i = 0; i < Selection->Num(); i++)
+		// Apply movement only to the de-duplicated set (attached children excluded so the
+		// delta isn't applied twice — once via the parent's move, once directly).
+		TArray<AActor*> ActorsToMove;
+		GetActorsToTransform(Selection, ActorsToMove);
+		for (AActor* Actor : ActorsToMove)
 		{
-			AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i));
-			if (Actor)
-			{
-				Actor->Modify();
-				FVector NewLocation = Actor->GetActorLocation() + ActualDelta;
-				Actor->SetActorLocation(NewLocation);
-				Actor->PostEditMove(false);
-			}
+			Actor->Modify();
+			FVector NewLocation = Actor->GetActorLocation() + ActualDelta;
+			Actor->SetActorLocation(NewLocation);
+			Actor->PostEditMove(false);
 		}
 
+		RefreshEditorPivot(Selection);
 		GEditor->NoteSelectionChange();
 		GEditor->RedrawLevelEditingViewports();
 	}
@@ -839,18 +920,17 @@ private:
 			AccumulatedMovement = FVector::ZeroVector;
 		}
 
-		for (int32 i = 0; i < Selection->Num(); i++)
+		TArray<AActor*> ActorsToMove;
+		GetActorsToTransform(Selection, ActorsToMove);
+		for (AActor* Actor : ActorsToMove)
 		{
-			AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i));
-			if (Actor)
-			{
-				Actor->Modify();
-				FVector NewLocation = Actor->GetActorLocation() + ActualDelta;
-				Actor->SetActorLocation(NewLocation);
-				Actor->PostEditMove(false);
-			}
+			Actor->Modify();
+			FVector NewLocation = Actor->GetActorLocation() + ActualDelta;
+			Actor->SetActorLocation(NewLocation);
+			Actor->PostEditMove(false);
 		}
 
+		RefreshEditorPivot(Selection);
 		GEditor->NoteSelectionChange();
 		GEditor->RedrawLevelEditingViewports();
 	}
@@ -961,41 +1041,49 @@ private:
 			}
 		}
 
-		// Collect actors to rotate and check for groups
+		// Collect actors to rotate, de-duplicated the same way the move path is: attached children
+		// whose ancestor is also selected are skipped, so they rotate ONCE (carried rigidly by their
+		// parent) instead of twice — the double-transform is what threw grouped meshes into disarray.
 		TArray<AActor*> ActorsToRotate;
-		AGroupActor* GroupActor = nullptr;
-
-		for (int32 i = 0; i < Selection->Num(); i++)
-		{
-			AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i));
-			if (Actor)
-			{
-				// Check if this actor is part of a group (GetRootForActor is exported, GetParentForActor is not)
-				if (!GroupActor)
-				{
-					GroupActor = AGroupActor::GetRootForActor(Actor);
-				}
-				ActorsToRotate.Add(Actor);
-			}
-		}
+		GetActorsToTransform(Selection, ActorsToRotate);
 
 		if (ActorsToRotate.Num() == 0)
 		{
 			return;
 		}
 
+		// Detect locked group roots, so we can pivot around the same point the editor's gizmo uses
+		// AND rotate the roots themselves (below). The gizmo's pivot location and its local-space
+		// orientation for a locked group both derive from the group ROOT actor's transform, not the
+		// members'. If we only rotate members, the root stays at identity rotation, so the gizmo
+		// never tilts and Local/World coord space look identical no matter how far you spin it.
+		TSet<AGroupActor*> LockedRoots;
+		for (AActor* Actor : ActorsToRotate)
+		{
+			if (AGroupActor* Root = AGroupActor::GetRootForActor(Actor, /*bMustBeLocked*/ true))
+			{
+				LockedRoots.Add(Root);
+			}
+		}
+		AGroupActor* LockedGroupRoot = LockedRoots.IsEmpty() ? nullptr : *LockedRoots.CreateConstIterator();
+
 		// Use shared drag transaction so entire Q+scroll session is one undo
 		EnsureDragTransaction(FText::FromString(TEXT("Rotate Selected")));
 
-		// Determine pivot point for rotation
-		// If grouped or multiple selection, rotate around the center
-		// If single actor, rotate around its own pivot
+		// Determine pivot point for rotation, matching the visible gizmo:
+		//   - Locked group: the gizmo sits at the group ROOT's location (see
+		//     UUnrealEdEngine::UpdatePivotLocationForSelection), so rotate around that.
+		//   - Multiple actors: rotate around their shared center.
+		//   - Single actor: rotate around its own pivot (yaw only, no positional swing).
 		FVector RotationPivot = FVector::ZeroVector;
-		bool bRotateAroundPivot = (ActorsToRotate.Num() > 1) || (GroupActor != nullptr);
+		bool bRotateAroundPivot = (ActorsToRotate.Num() > 1) || (LockedGroupRoot != nullptr);
 
-		if (bRotateAroundPivot)
+		if (LockedGroupRoot)
 		{
-			// Calculate center of all actors
+			RotationPivot = LockedGroupRoot->GetActorLocation();
+		}
+		else if (bRotateAroundPivot)
+		{
 			for (AActor* Actor : ActorsToRotate)
 			{
 				RotationPivot += Actor->GetActorLocation();
@@ -1026,6 +1114,20 @@ private:
 			Actor->PostEditMove(true);
 		}
 
+		// Rotate the group root(s) in place too, so the gizmo's orientation (and thus Local-space
+		// coord) reflects the accumulated rotation. The root isn't attached to its members, so
+		// spinning its yaw doesn't move them — it only reorients the group's own transform.
+		for (AGroupActor* Root : LockedRoots)
+		{
+			Root->Modify();
+			FRotator RootRotation = Root->GetActorRotation();
+			RootRotation.Yaw += RotationAmount;
+			Root->SetActorRotation(RootRotation);
+		}
+
+		// Recenter any locked group root to the members' new bounds and refresh the gizmo pivot so
+		// it tracks the rotated group instead of staying pinned at the pre-rotation location.
+		RefreshEditorPivot(Selection);
 		GEditor->NoteSelectionChange();
 		GEditor->RedrawLevelEditingViewports();
 	}
