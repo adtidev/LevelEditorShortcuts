@@ -1,9 +1,14 @@
-// LockBrowserTab.cpp
+﻿// LockBrowserTab.cpp
 // Dockable editor tab that lists Perforce-locked .uasset/.umap files in the active map,
 // resolving each GUID file path back to its actor name by walking the loaded world.
 // Designed for World Partition projects where map external-actor files are GUID-named.
 //
 // Shortcut: Shift+4 toggles the tab (handled by the existing input processor).
+//
+// Shared-checkout watcher: every WatchIntervalSeconds, polls `p4 opened -a` in the background and pops a
+// toast when a file I have checked out is ALSO checked out by someone else (another user, or my own other
+// workspace). Stock UE can't show this: the Perforce provider drops `otherOpen` once the file is mine.
+// See Docs/Features/wp-revision-control.md.
 
 #include "CoreMinimal.h"
 #include "Widgets/Docking/SDockTab.h"
@@ -37,6 +42,13 @@
 #include "Misc/ConfigCacheIni.h"
 #include "HAL/PlatformProperties.h"
 #include "Internationalization/Text.h"
+#include <atomic>
+#include "Containers/Ticker.h"
+#include "Framework/Notifications/NotificationManager.h"
+#include "Widgets/Notifications/SNotificationList.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "WorldPartition/WorldPartitionActorDesc.h"
+#include "WorldPartition/WorldPartitionActorDescUtils.h"
 
 #define LOCTEXT_NAMESPACE "LockBrowser"
 
@@ -56,6 +68,7 @@ namespace LockBrowser
 		FString ActorName;       // resolved by walking the world (or "" if not loaded / not WP)
 		FString ActorClass;
 		bool bIsMine = false;
+		FString AlsoOpenedBy;    // mine only: "user @ workspace, ..." of everyone else who has this file open
 	};
 
 	struct FP4Connection
@@ -173,22 +186,30 @@ namespace LockBrowser
 		// Determine the current p4 user so we can flag rows as "mine".
 		// Prefer the value from UE's SCC settings (always trustworthy when bHaveSettings is true);
 		// otherwise fall back to `p4 info` to honour env/P4CONFIG.
+		// The workspace matters too: the same user in a second workspace (e.g. the laptop) is a real double checkout.
 		FString MyUser = Conn.User;
-		if (MyUser.IsEmpty())
+		FString MyClient = Conn.Client;
+		if (MyUser.IsEmpty() || MyClient.IsEmpty())
 		{
 			int32 RC2 = -1;
 			FString Out2;
 			FString Err2;
-			const FString InfoArgs = ConnFlags + TEXT("-F \"%userName%\" -ztag info");
+			const FString InfoArgs = ConnFlags + TEXT("-F \"%userName%|%clientName%\" -ztag info");
 			FPlatformProcess::ExecProcess(TEXT("p4"), *InfoArgs, &RC2, &Out2, &Err2);
 			if (RC2 == 0)
 			{
-				MyUser = Out2.TrimStartAndEnd();
+				FString InfoLine = Out2.TrimStartAndEnd();
 				// If multiple lines came back, take the first.
 				int32 NL = INDEX_NONE;
-				if (MyUser.FindChar(TEXT('\n'), NL))
+				if (InfoLine.FindChar(TEXT('\n'), NL))
 				{
-					MyUser = MyUser.Left(NL).TrimStartAndEnd();
+					InfoLine = InfoLine.Left(NL).TrimStartAndEnd();
+				}
+				FString InfoUser, InfoClient;
+				if (InfoLine.Split(TEXT("|"), &InfoUser, &InfoClient))
+				{
+					if (MyUser.IsEmpty())   { MyUser = InfoUser.TrimStartAndEnd(); }
+					if (MyClient.IsEmpty()) { MyClient = InfoClient.TrimStartAndEnd(); }
 				}
 			}
 		}
@@ -209,10 +230,71 @@ namespace LockBrowser
 			Entry.User      = Cols[2].TrimStartAndEnd();
 			Entry.Workspace = Cols[3].TrimStartAndEnd();
 			Entry.PackageName = DepotPathToPackageName(Entry.DepotPath);
-			Entry.bIsMine = !MyUser.IsEmpty() && Entry.User.Equals(MyUser, ESearchCase::IgnoreCase);
+			Entry.bIsMine = !MyUser.IsEmpty() && Entry.User.Equals(MyUser, ESearchCase::IgnoreCase)
+				&& (MyClient.IsEmpty() || Entry.Workspace.Equals(MyClient, ESearchCase::IgnoreCase));
 			OutEntries.Add(MoveTemp(Entry));
 		}
+
+		// Flag my files that someone else also has open.
+		TMap<FString, FString> OthersByFile;
+		for (const FLockEntry& E : OutEntries)
+		{
+			if (!E.bIsMine)
+			{
+				FString& Who = OthersByFile.FindOrAdd(E.DepotPath);
+				Who += (Who.IsEmpty() ? TEXT("") : TEXT(", ")) + E.User + TEXT(" @ ") + E.Workspace;
+			}
+		}
+		for (FLockEntry& E : OutEntries)
+		{
+			if (E.bIsMine)
+			{
+				if (const FString* Who = OthersByFile.Find(E.DepotPath))
+				{
+					E.AlsoOpenedBy = *Who;
+				}
+			}
+		}
 		return true;
+	}
+
+	/** Actor label + class for a package: the loaded editor world first, then the asset registry's
+	 *  WP actor descriptor so actors in unloaded cells still get a readable name. */
+	static void ResolveActor(const TMap<FString, AActor*>& PackageToActor, FLockEntry& E)
+	{
+		if (AActor* const* Found = PackageToActor.Find(E.PackageName))
+		{
+			if (AActor* Actor = *Found)
+			{
+				E.ActorName  = Actor->GetActorNameOrLabel();
+				E.ActorClass = Actor->GetClass()->GetName();
+				return;
+			}
+		}
+		if (E.PackageName.IsEmpty() || !E.DepotPath.Contains(TEXT("__ExternalActors__")))
+		{
+			return;
+		}
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		TArray<FAssetData> Assets;
+		Registry.GetAssetsByPackageName(FName(*E.PackageName), Assets, /*bIncludeOnlyOnDiskAssets*/ true);
+		for (const FAssetData& Asset : Assets)
+		{
+			if (TUniquePtr<FWorldPartitionActorDesc> Desc = FWorldPartitionActorDescUtils::GetActorDescriptorFromAssetData(Asset))
+			{
+				E.ActorName  = Desc->GetActorLabelOrName().ToString();
+				E.ActorClass = Desc->GetDisplayClassNameString();
+				return;
+			}
+		}
+	}
+
+	/** Pretty "Label (Class)" or the bare GUID filename when unresolved. */
+	static FString DisplayName(const FLockEntry& E)
+	{
+		return E.ActorName.IsEmpty()
+			? FPaths::GetBaseFilename(E.DepotPath)
+			: E.ActorName + (E.ActorClass.IsEmpty() ? FString() : FString::Printf(TEXT("  (%s)"), *E.ActorClass));
 	}
 
 	/** The Slate widget itself. */
@@ -245,6 +327,16 @@ namespace LockBrowser
 						.OnCheckStateChanged_Lambda([this](ECheckBoxState S) { bShowOnlyOthers = (S == ECheckBoxState::Checked); RebuildVisible(); })
 						[
 							SNew(STextBlock).Text(LOCTEXT("HideMine", "Only others"))
+						]
+					]
+					+ SHorizontalBox::Slot().AutoWidth().Padding(8.f, 0.f, 2.f, 0.f).VAlign(VAlign_Center)
+					[
+						SNew(SCheckBox)
+						.IsChecked_Lambda([this]() { return bShowOnlyShared ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+						.OnCheckStateChanged_Lambda([this](ECheckBoxState S) { bShowOnlyShared = (S == ECheckBoxState::Checked); RebuildVisible(); })
+						.ToolTipText(LOCTEXT("OnlySharedTip", "Only files I have checked out that someone else also has checked out"))
+						[
+							SNew(STextBlock).Text(LOCTEXT("OnlyShared", "Only mine shared with others"))
 						]
 					]
 					+ SHorizontalBox::Slot().AutoWidth().Padding(8.f, 0.f, 2.f, 0.f).VAlign(VAlign_Center)
@@ -349,14 +441,7 @@ namespace LockBrowser
 			AllEntries.Reset(Entries.Num());
 			for (FLockEntry& E : Entries)
 			{
-				if (AActor** Found = PackageToActor.Find(E.PackageName))
-				{
-					if (AActor* Actor = *Found)
-					{
-						E.ActorName  = Actor->GetActorNameOrLabel();
-						E.ActorClass = Actor->GetClass()->GetName();
-					}
-				}
+				ResolveActor(PackageToActor, E);
 				AllEntries.Add(MakeShared<FLockEntry>(MoveTemp(E)));
 			}
 
@@ -378,6 +463,10 @@ namespace LockBrowser
 					continue;
 				}
 				if (bShowOnlyOthers && E->bIsMine)
+				{
+					continue;
+				}
+				if (bShowOnlyShared && E->AlsoOpenedBy.IsEmpty())
 				{
 					continue;
 				}
@@ -414,13 +503,18 @@ namespace LockBrowser
 
 		TSharedRef<ITableRow> OnGenerateRow(TSharedPtr<FLockEntry> Item, const TSharedRef<STableViewBase>& OwnerTable)
 		{
-			const FString Display = Item->ActorName.IsEmpty()
-				? FPaths::GetBaseFilename(Item->DepotPath)
-				: Item->ActorName + (Item->ActorClass.IsEmpty() ? FString() : FString::Printf(TEXT("  (%s)"), *Item->ActorClass));
+			const FString Display = DisplayName(*Item);
+			const bool bShared = !Item->AlsoOpenedBy.IsEmpty();
 
-			const FSlateColor RowColor = Item->bIsMine
-				? FSlateColor(FLinearColor(0.55f, 0.85f, 0.55f))
-				: FSlateColor(FLinearColor(1.0f, 0.55f, 0.55f));
+			// Green = mine, red = someone else's, orange = mine AND someone else has it too.
+			const FSlateColor RowColor = bShared
+				? FSlateColor(FLinearColor(1.0f, 0.65f, 0.15f))
+				: Item->bIsMine
+					? FSlateColor(FLinearColor(0.55f, 0.85f, 0.55f))
+					: FSlateColor(FLinearColor(1.0f, 0.55f, 0.55f));
+			const FString UserText = bShared
+				? Item->User + TEXT("  + ") + Item->AlsoOpenedBy
+				: Item->User;
 
 			return SNew(STableRow<TSharedPtr<FLockEntry>>, OwnerTable)
 			[
@@ -431,7 +525,7 @@ namespace LockBrowser
 				]
 				+ SHorizontalBox::Slot().FillWidth(0.20f).Padding(2.f)
 				[
-					SNew(STextBlock).Text(FText::FromString(Item->User))
+					SNew(STextBlock).Text(FText::FromString(UserText)).ColorAndOpacity(bShared ? RowColor : FSlateColor::UseForeground())
 				]
 				+ SHorizontalBox::Slot().FillWidth(0.10f).Padding(2.f)
 				[
@@ -478,6 +572,7 @@ namespace LockBrowser
 		FText StatusText;
 		bool bRefreshing = false;
 		bool bShowOnlyOthers = false;
+		bool bShowOnlyShared = false;
 		bool bExternalActorsOnly = true;
 		FString SearchText;
 	};
@@ -491,8 +586,147 @@ namespace LockBrowser
 			];
 	}
 
+	void Toggle();
+
+	/** Background poll: toast when a file I have checked out is also checked out by someone else. */
+	namespace SharedCheckoutWatch
+	{
+		static constexpr float FirstCheckSeconds = 20.f;
+		static constexpr float WatchIntervalSeconds = 60.f;
+
+		static FTSTicker::FDelegateHandle TickHandle;
+		static std::atomic<bool> bQueryRunning{false};
+		static bool bLoggedFailure = false;
+		static float SecondsUntilCheck = FirstCheckSeconds;
+		// "DepotPath|others" already toasted. Pruned each poll, so a share that ends and recurs warns again.
+		static TSet<FString> NotifiedKeys;
+
+		static void OnResult(TArray<FLockEntry> Entries, bool bOk, const FString& Error)
+		{
+			bQueryRunning = false;
+			if (!bOk)
+			{
+				if (!bLoggedFailure)
+				{
+					UE_LOG(LogLockBrowser, Warning, TEXT("[SharedCheckout] p4 opened failed, watcher idle until it works: %s"), *Error);
+					bLoggedFailure = true;
+				}
+				return;
+			}
+			bLoggedFailure = false;
+
+			TMap<FString, AActor*> PackageToActor;
+			bool bBuiltMap = false;
+
+			TSet<FString> CurrentKeys;
+			TArray<FString> NewLines;
+			for (FLockEntry& E : Entries)
+			{
+				if (!E.bIsMine || E.AlsoOpenedBy.IsEmpty())
+				{
+					continue;
+				}
+				const FString Key = E.DepotPath + TEXT("|") + E.AlsoOpenedBy;
+				CurrentKeys.Add(Key);
+				if (NotifiedKeys.Contains(Key))
+				{
+					continue;
+				}
+				if (!bBuiltMap)
+				{
+					BuildPackageToActorMap(PackageToActor);
+					bBuiltMap = true;
+				}
+				ResolveActor(PackageToActor, E);
+				NewLines.Add(FString::Printf(TEXT("%s  —  %s"), *DisplayName(E), *E.AlsoOpenedBy));
+				UE_LOG(LogLockBrowser, Warning, TEXT("[SharedCheckout] %s also checked out by %s (%s)"),
+					*DisplayName(E), *E.AlsoOpenedBy, *E.DepotPath);
+			}
+			NotifiedKeys = MoveTemp(CurrentKeys);
+
+			if (NewLines.Num() == 0)
+			{
+				return;
+			}
+
+			static constexpr int32 MaxListed = 6;
+			FString Body;
+			for (int32 i = 0; i < NewLines.Num() && i < MaxListed; ++i)
+			{
+				Body += NewLines[i] + TEXT("\n");
+			}
+			if (NewLines.Num() > MaxListed)
+			{
+				Body += FString::Printf(TEXT("…and %d more"), NewLines.Num() - MaxListed);
+			}
+
+			FNotificationInfo Info(FText::Format(
+				LOCTEXT("SharedCheckoutTitle", "{0} of your checked-out files also checked out by someone else"),
+				FText::AsNumber(NewLines.Num())));
+			Info.SubText = FText::FromString(Body.TrimEnd());
+			Info.ExpireDuration = 12.f;
+			Info.bFireAndForget = true;
+			Info.bUseLargeFont = false;
+			Info.Hyperlink = FSimpleDelegate::CreateStatic(&Toggle);
+			Info.HyperlinkText = LOCTEXT("SharedCheckoutLink", "Open Lock Browser");
+			if (TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
+			{
+				Item->SetCompletionState(SNotificationItem::CS_Fail);
+			}
+		}
+
+		static bool Tick(float DeltaTime)
+		{
+			SecondsUntilCheck -= DeltaTime;
+			if (SecondsUntilCheck > 0.f || bQueryRunning)
+			{
+				return true;
+			}
+			SecondsUntilCheck = WatchIntervalSeconds;
+			bQueryRunning = true;
+			AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, []()
+			{
+				TArray<FLockEntry> Entries;
+				FString Error;
+				const bool bOk = RunP4Opened(Entries, Error);
+				AsyncTask(ENamedThreads::GameThread, [Entries = MoveTemp(Entries), bOk, Error = MoveTemp(Error)]() mutable
+				{
+					if (TickHandle.IsValid())
+					{
+						OnResult(MoveTemp(Entries), bOk, Error);
+					}
+					else
+					{
+						bQueryRunning = false;
+					}
+				});
+			});
+			return true;
+		}
+
+		static void Start()
+		{
+			if (!TickHandle.IsValid() && !IsRunningCommandlet())
+			{
+				SecondsUntilCheck = FirstCheckSeconds;
+				TickHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick));
+			}
+		}
+
+		static void Stop()
+		{
+			if (TickHandle.IsValid())
+			{
+				FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
+				TickHandle.Reset();
+			}
+			NotifiedKeys.Reset();
+		}
+	}
+
 	void Register()
 	{
+		SharedCheckoutWatch::Start();
 		FGlobalTabmanager::Get()->RegisterNomadTabSpawner(TabId, FOnSpawnTab::CreateStatic(&SpawnTab))
 			.SetDisplayName(LOCTEXT("TabDisplayName", "Lock Browser"))
 			.SetTooltipText(LOCTEXT("TabTooltip", "Live view of Perforce-locked files in this project (Shift+4)."))
@@ -501,6 +735,7 @@ namespace LockBrowser
 
 	void Unregister()
 	{
+		SharedCheckoutWatch::Stop();
 		if (FGlobalTabmanager::Get()->HasTabSpawner(TabId))
 		{
 			FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(TabId);

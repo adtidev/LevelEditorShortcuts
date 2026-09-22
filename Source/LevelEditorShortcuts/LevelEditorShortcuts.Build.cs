@@ -23,7 +23,8 @@ public class LevelEditorShortcuts : ModuleRules
 			"LevelEditor",
 			"WorkspaceMenuStructure",
 			"ToolMenus",
-			"Projects"
+			"Projects",
+			"AssetRegistry"
 		});
 	}
 }
