@@ -13,8 +13,6 @@ Unreal Engine 5 editor plugin that adds keyboard shortcuts for faster level edit
 - **Transform copy/paste** — Ctrl+C copies the selected actor's transform. Ctrl+T pastes location and rotation to selected actor(s) while preserving their scale.
 - **Duplicate in place** — Ctrl+D duplicates without the default offset that Unreal adds.
 - **Snap to ground** — Ctrl+B snaps to ground and inherits the surface slope rotation. Shift+B snaps to ground but keeps world-up orientation. Both modes use mesh/collision bounds to place the object's bottom on the surface, and skip query-only/overlap colliders.
-- **Paste to folder** — Ctrl+Shift+V pastes clipboard actors into the same World Outliner folder as the currently selected actor.
-- **Full undo support** — All drag operations (Q/E/R) create a single undo transaction, so one Ctrl+Z undoes the entire drag.
 
 ## Installation
 
