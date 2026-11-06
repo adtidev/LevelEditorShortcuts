@@ -1,4 +1,4 @@
-// TransformCopyPasteProcessor.cpp
+﻿// TransformCopyPasteProcessor.cpp
 // Editor-only input processor for transform shortcuts:
 // Ctrl+C: Copies location/rotation of selected actor (normal copy still works)
 // Ctrl+T: Pastes location/rotation to selected actor(s), keeps original scale
@@ -19,6 +19,7 @@
 #include "Components/PrimitiveComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Editor/GroupActor.h"
 
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -171,6 +172,13 @@ public:
 	}
 
 private:
+	// Ctrl+C / Ctrl+X: remember the selection's transform.
+	//
+	// For a single actor this is just its transform. For a group / multi-selection it's the
+	// CENTROID of the members (with the first member's rotation), which is the same measure
+	// PasteTransformToSelected() moves rigidly - so copy a group, paste onto a group, and the two
+	// centroids line up. Reading Selection index 0 instead would pick either the passive
+	// AGroupActor container or an arbitrary member, depending on click order.
 	void CopySelectedTransform()
 	{
 		if (!GEditor)
@@ -184,17 +192,47 @@ private:
 			return;
 		}
 
-		// Get the first selected actor
-		AActor* SelectedActor = Cast<AActor>(Selection->GetSelectedObject(0));
-		if (!SelectedActor)
+		TArray<AActor*> Actors;
+		GetActorsToTransform(Selection, Actors);
+		if (Actors.Num() == 0)
 		{
 			return;
 		}
 
-		CopiedTransform = SelectedActor->GetActorTransform();
+		if (Actors.Num() == 1)
+		{
+			CopiedTransform = Actors[0]->GetActorTransform();
+		}
+		else
+		{
+			FVector Centroid = FVector::ZeroVector;
+			for (AActor* Actor : Actors)
+			{
+				Centroid += Actor->GetActorLocation();
+			}
+			Centroid /= (double)Actors.Num();
+
+			CopiedTransform = Actors[0]->GetActorTransform();
+			CopiedTransform.SetLocation(Centroid);
+		}
+
 		bHasCopiedTransform = true;
 	}
 
+	// Ctrl+T: paste the copied transform onto the selection.
+	//
+	// This used to loop over every selected actor and slam each one to the IDENTICAL copied
+	// location and rotation. Select a group and every member collapses onto a single point wearing
+	// one shared rotation - the formation is gone. Same bug the B-snaps and the N camera-snap were
+	// already fixed for; Ctrl+T was missed.
+	//
+	// Now: a single actor takes the copied location AND rotation (unchanged everyday behaviour).
+	// A group / multi-selection moves RIGIDLY - the selection's centroid lands on the copied
+	// location and every member keeps its relative offset and its own rotation.
+	//
+	// GetActorsToTransform() drops the passive AGroupActor container and any actor whose selected
+	// ancestor already carries it via attachment, so nothing is moved twice. RefreshEditorPivot()
+	// re-centres a locked group's root and the gizmo afterwards.
 	bool PasteTransformToSelected()
 	{
 		if (!GEditor || !bHasCopiedTransform)
@@ -208,35 +246,291 @@ private:
 			return false;
 		}
 
+		TArray<AActor*> Actors;
+		GetActorsToTransform(Selection, Actors);
+		if (Actors.Num() == 0)
+		{
+			return false;
+		}
+
 		// Create undo transaction
 		FScopedTransaction Transaction(FText::FromString(TEXT("Paste Transform")));
 
-		int32 NumModified = 0;
-		for (int32 i = 0; i < Selection->Num(); i++)
+		if (Actors.Num() == 1)
 		{
-			AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i));
-			if (Actor)
+			AActor* Actor = Actors[0];
+			Actor->Modify();
+			Actor->SetActorLocation(CopiedTransform.GetLocation());
+			Actor->SetActorRotation(CopiedTransform.GetRotation().Rotator());
+			// Keep original scale - don't apply CopiedTransform scale
+			Actor->PostEditMove(true);
+		}
+		else
+		{
+			FVector Centroid = FVector::ZeroVector;
+			for (AActor* Actor : Actors)
+			{
+				Centroid += Actor->GetActorLocation();
+			}
+			Centroid /= (double)Actors.Num();
+
+			const FVector Delta = CopiedTransform.GetLocation() - Centroid;
+			for (AActor* Actor : Actors)
 			{
 				Actor->Modify();
-				Actor->SetActorLocation(CopiedTransform.GetLocation());
-				Actor->SetActorRotation(CopiedTransform.GetRotation().Rotator());
-				// Keep original scale - don't apply CopiedTransform scale
+				Actor->SetActorLocation(Actor->GetActorLocation() + Delta);
+				// Rotations left alone: applying one shared rotation to every member is what
+				// shredded the formation.
 				Actor->PostEditMove(true);
-				NumModified++;
 			}
 		}
 
-		if (NumModified > 0)
-		{
-			GEditor->NoteSelectionChange();
-			GEditor->RedrawLevelEditingViewports();
-			return true;
-		}
-
-		return false;
+		RefreshEditorPivot(Selection);
+		GEditor->NoteSelectionChange();
+		GEditor->RedrawLevelEditingViewports();
+		return true;
 	}
 
-	bool SnapSelectedToGround()
+	// ---- Group-safe ground snapping -------------------------------------------------
+	//
+	// Ctrl+B (snap to floor, inherits slope) and Shift+B (snap to floor, upright) used to loop over
+	// every selected actor and drop each one independently onto whatever happened to be under it,
+	// then overwrite its rotation. On a group that shreds the formation: members land at different
+	// heights and each takes its own surface tilt.
+	//
+	// Now a single actor behaves exactly as before, and a group / multi-selection moves RIGIDLY:
+	// one shared Z delta for everyone, rotations left alone. The shared delta is the LARGEST lift
+	// any member needs, so nothing ends up buried in the terrain.
+
+	// Distance in world Z from the actor's origin down to the bottom of its mesh/collision.
+	// Uses LOCAL bounds so animation bloat doesn't inflate it.
+	float GetMeshBottomOffset(AActor* Actor) const
+	{
+		const FVector ActorLocation = Actor->GetActorLocation();
+
+		auto BottomOffsetFor = [&ActorLocation](UPrimitiveComponent* Comp) -> float
+		{
+			FBoxSphereBounds LocalBounds = Comp->CalcLocalBounds();
+			FVector LocalBottom = FVector(0, 0, LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z);
+			FVector WorldBottom = Comp->GetComponentTransform().TransformPosition(LocalBottom);
+			return ActorLocation.Z - WorldBottom.Z;
+		};
+
+		if (USkeletalMeshComponent* SkelMesh = Actor->FindComponentByClass<USkeletalMeshComponent>())
+		{
+			return BottomOffsetFor(SkelMesh);
+		}
+		if (UStaticMeshComponent* StaticMesh = Actor->FindComponentByClass<UStaticMeshComponent>())
+		{
+			return BottomOffsetFor(StaticMesh);
+		}
+
+		// Fall back to the first primitive with blocking collision (skip query-only spheres, triggers, etc.)
+		TArray<UPrimitiveComponent*> PrimComps;
+		Actor->GetComponents<UPrimitiveComponent>(PrimComps);
+		for (UPrimitiveComponent* Comp : PrimComps)
+		{
+			ECollisionEnabled::Type ColType = Comp->GetCollisionEnabled();
+			if (ColType == ECollisionEnabled::QueryAndPhysics || ColType == ECollisionEnabled::PhysicsOnly)
+			{
+				return BottomOffsetFor(Comp);
+			}
+		}
+
+		// No physics collision component: treat the root as the ground contact point.
+		return 0.0f;
+	}
+
+	// Every actor a snap is about to move, plus everything attached beneath them, plus every member
+	// of any group they belong to. A ground trace MUST ignore all of it: a member resting on top of
+	// another member of the same group traces onto its own mate, reports "already grounded", and
+	// that near-zero delta then vetoes the whole group's fall (see the shared-delta comment below).
+	void BuildIgnoreSet(const TArray<AActor*>& MovingActors, TSet<AActor*>& OutIgnore) const
+	{
+		for (AActor* Actor : MovingActors)
+		{
+			if (!Actor)
+			{
+				continue;
+			}
+			OutIgnore.Add(Actor);
+
+			TArray<AActor*> Attached;
+			Actor->GetAttachedActors(Attached, true, true);
+			for (AActor* Child : Attached)
+			{
+				OutIgnore.Add(Child);
+			}
+
+			if (AGroupActor* Root = AGroupActor::GetRootForActor(Actor, /*bMustBeLocked*/ false))
+			{
+				TArray<AActor*> Members;
+				Root->GetGroupActors(Members, /*bRecurse*/ true);
+				for (AActor* Member : Members)
+				{
+					if (!Member)
+					{
+						continue;
+					}
+					OutIgnore.Add(Member);
+
+					TArray<AActor*> MemberAttached;
+					Member->GetAttachedActors(MemberAttached, true, true);
+					for (AActor* Child : MemberAttached)
+					{
+						OutIgnore.Add(Child);
+					}
+				}
+			}
+		}
+	}
+
+	// Traces straight down from the actor and returns the Z delta needed to sit it on the surface.
+	// IgnoreActors is everything moving with this snap - see BuildIgnoreSet().
+	bool ComputeGroundDelta(UWorld* World, AActor* Actor, const TSet<AActor*>& IgnoreActors, float& OutDeltaZ, FHitResult& OutHit) const
+	{
+		const FVector ActorLocation = Actor->GetActorLocation();
+		const float MeshBottomOffset = GetMeshBottomOffset(Actor);
+
+		// Start just above the actor's own mesh bottom, not a flat 500cm overhead. A high start
+		// lets the downward trace hit whatever hangs ABOVE the actor (a mate's underside, a bridge,
+		// a roof) and read it as "ground", which produces a big bogus LIFT. 100cm of headroom is
+		// enough to recover an actor buried up to a metre in the terrain.
+		const FVector TraceStart(ActorLocation.X, ActorLocation.Y, ActorLocation.Z - MeshBottomOffset + 100.f);
+		const FVector TraceEnd = TraceStart - FVector(0, 0, 200000.f);
+
+		FCollisionQueryParams QueryParams;
+		QueryParams.AddIgnoredActor(Actor);
+
+		// Recursively ignore all attached actors
+		TArray<AActor*> AttachedActors;
+		Actor->GetAttachedActors(AttachedActors, true, true);
+		for (AActor* Attached : AttachedActors)
+		{
+			QueryParams.AddIgnoredActor(Attached);
+		}
+
+		for (AActor* Ignored : IgnoreActors)
+		{
+			if (Ignored)
+			{
+				QueryParams.AddIgnoredActor(Ignored);
+			}
+		}
+
+		bool bHit = false;
+
+		// Use channel trace (ECC_Visibility) - respects collision responses,
+		// so query-only/overlap components are automatically skipped
+		for (int32 Attempt = 0; Attempt < 50; Attempt++)
+		{
+			bHit = World->LineTraceSingleByChannel(OutHit, TraceStart, TraceEnd, ECC_Visibility, QueryParams);
+			if (!bHit)
+			{
+				break;
+			}
+
+			// Also skip components with query-only collision (blocks Visibility but no physics)
+			UPrimitiveComponent* HitComp = OutHit.GetComponent();
+			if (HitComp)
+			{
+				ECollisionEnabled::Type CollisionType = HitComp->GetCollisionEnabled();
+				if (CollisionType == ECollisionEnabled::QueryAndPhysics || CollisionType == ECollisionEnabled::PhysicsOnly)
+				{
+					break; // Valid collidable surface
+				}
+			}
+
+			// Skip this specific component and trace again
+			if (HitComp)
+			{
+				QueryParams.AddIgnoredComponent(HitComp);
+			}
+			bHit = false;
+		}
+
+		if (!bHit)
+		{
+			return false;
+		}
+
+		const float DesiredZ = OutHit.ImpactPoint.Z + MeshBottomOffset + 5.0f;
+		OutDeltaZ = DesiredZ - ActorLocation.Z;
+		return true;
+	}
+
+	// Build the list of actors a snap should move directly. Drops the passive AGroupActor container
+	// (it has no geometry; the engine recentres it from its members) and any actor whose attachment
+	// ancestor is also selected - that ancestor already carries it, so moving both double-applies
+	// and scatters the formation.
+	void GetActorsToTransform(USelection* Selection, TArray<AActor*>& OutActors) const
+	{
+		TSet<AActor*> SelectedSet;
+		for (int32 i = 0; i < Selection->Num(); i++)
+		{
+			if (AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i)))
+			{
+				SelectedSet.Add(Actor);
+			}
+		}
+
+		for (AActor* Actor : SelectedSet)
+		{
+			if (Actor->IsA(AGroupActor::StaticClass()))
+			{
+				continue;
+			}
+
+			bool bAncestorSelected = false;
+			for (AActor* Parent = Actor->GetAttachParentActor(); Parent; Parent = Parent->GetAttachParentActor())
+			{
+				if (SelectedSet.Contains(Parent))
+				{
+					bAncestorSelected = true;
+					break;
+				}
+			}
+
+			if (!bAncestorSelected)
+			{
+				OutActors.Add(Actor);
+			}
+		}
+	}
+
+	// We move actors directly via SetActorLocation, which bypasses the native gizmo drag path that
+	// normally keeps the pivot in sync. For a LOCKED group the pivot is forced to the group ROOT's
+	// own location (UUnrealEdEngine::UpdatePivotLocationForSelection), and we never touch the root,
+	// so it stays pinned where the members used to be. CenterGroupLocation() moves only the root,
+	// back to the members' new bounds centre - exactly what the engine does after a native move.
+	void RefreshEditorPivot(USelection* Selection)
+	{
+		TSet<AGroupActor*> LockedRoots;
+		for (int32 i = 0; i < Selection->Num(); i++)
+		{
+			if (AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i)))
+			{
+				if (AGroupActor* Root = AGroupActor::GetRootForActor(Actor, /*bMustBeLocked*/ true))
+				{
+					LockedRoots.Add(Root);
+				}
+			}
+		}
+		for (AGroupActor* Root : LockedRoots)
+		{
+			Root->CenterGroupLocation();
+		}
+
+		if (GUnrealEd)
+		{
+			GUnrealEd->UpdatePivotLocationForSelection();
+		}
+	}
+
+	// bInheritSurfaceRotation: true = Ctrl+B (tilt to the slope), false = Shift+B (force upright).
+	// Rotation is only ever touched for a SINGLE selected actor - a rigid group move must not
+	// re-rotate its members.
+	bool SnapSelectedToGroundInternal(bool bInheritSurfaceRotation)
 	{
 		if (!GEditor)
 		{
@@ -255,309 +549,139 @@ private:
 			return false;
 		}
 
-		// Create undo transaction
-		FScopedTransaction Transaction(FText::FromString(TEXT("Snap to Ground")));
-
-		int32 NumModified = 0;
-		for (int32 i = 0; i < Selection->Num(); i++)
+		TArray<AActor*> Actors;
+		GetActorsToTransform(Selection, Actors);
+		if (Actors.Num() == 0)
 		{
-			AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i));
-			if (!Actor)
-			{
-				continue;
-			}
+			return false;
+		}
 
-			FVector ActorLocation = Actor->GetActorLocation();
+		FScopedTransaction Transaction(FText::FromString(
+			bInheritSurfaceRotation ? TEXT("Snap to Ground") : TEXT("Snap to Ground (No Rotation)")));
 
-			// Get mesh component's LOCAL bounds (not affected by animation bloat)
-			// This gives us the actual mesh geometry bounds
-			float MeshBottomOffset = 0.0f; // Distance from actor origin to mesh bottom
+		// ---- Single actor: original behaviour, rotation included --------------------
+		if (Actors.Num() == 1)
+		{
+			AActor* Actor = Actors[0];
 
-			if (USkeletalMeshComponent* SkelMesh = Actor->FindComponentByClass<USkeletalMeshComponent>())
-			{
-				FBoxSphereBounds LocalBounds = SkelMesh->CalcLocalBounds();
-				FVector LocalBottom = FVector(0, 0, LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z);
-				FVector WorldBottom = SkelMesh->GetComponentTransform().TransformPosition(LocalBottom);
-				MeshBottomOffset = ActorLocation.Z - WorldBottom.Z;
-			}
-			else if (UStaticMeshComponent* StaticMesh = Actor->FindComponentByClass<UStaticMeshComponent>())
-			{
-				FBoxSphereBounds LocalBounds = StaticMesh->CalcLocalBounds();
-				FVector LocalBottom = FVector(0, 0, LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z);
-				FVector WorldBottom = StaticMesh->GetComponentTransform().TransformPosition(LocalBottom);
-				MeshBottomOffset = ActorLocation.Z - WorldBottom.Z;
-			}
-			else
-			{
-				// Find first primitive component with blocking collision (skip query-only spheres, triggers, etc.)
-				UPrimitiveComponent* BestComp = nullptr;
-				TArray<UPrimitiveComponent*> PrimComps;
-				Actor->GetComponents<UPrimitiveComponent>(PrimComps);
-				for (UPrimitiveComponent* Comp : PrimComps)
-				{
-					ECollisionEnabled::Type ColType = Comp->GetCollisionEnabled();
-					if (ColType == ECollisionEnabled::QueryAndPhysics || ColType == ECollisionEnabled::PhysicsOnly)
-					{
-						BestComp = Comp;
-						break;
-					}
-				}
-
-				if (BestComp)
-				{
-					FBoxSphereBounds LocalBounds = BestComp->CalcLocalBounds();
-					FVector LocalBottom = FVector(0, 0, LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z);
-					FVector WorldBottom = BestComp->GetComponentTransform().TransformPosition(LocalBottom);
-					MeshBottomOffset = ActorLocation.Z - WorldBottom.Z;
-				}
-				// else: no physics collision component, use 0 offset (root = ground)
-			}
-
-			// Line trace from actor position downward
-			FVector TraceStart = ActorLocation + FVector(0, 0, 500.f);
-			FVector TraceEnd = TraceStart - FVector(0, 0, 200000.f);
-
-			FCollisionQueryParams QueryParams;
-			QueryParams.AddIgnoredActor(Actor);
-
-			// Recursively ignore all attached actors
-			TArray<AActor*> AttachedActors;
-			Actor->GetAttachedActors(AttachedActors, true, true);
-			for (AActor* Attached : AttachedActors)
-			{
-				QueryParams.AddIgnoredActor(Attached);
-			}
-
+			float DeltaZ = 0.0f;
 			FHitResult HitResult;
-			bool bHit = false;
-
-			// Use channel trace (ECC_Visibility) - respects collision responses,
-			// so query-only/overlap components are automatically skipped
-			for (int32 Attempt = 0; Attempt < 50; Attempt++)
+			TSet<AActor*> IgnoreActors;
+			BuildIgnoreSet(Actors, IgnoreActors);
+			if (!ComputeGroundDelta(World, Actor, IgnoreActors, DeltaZ, HitResult))
 			{
-				bHit = World->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, ECC_Visibility, QueryParams);
-				if (!bHit)
-				{
-					break;
-				}
-
-				// Also skip components with query-only collision (blocks Visibility but no physics)
-				UPrimitiveComponent* HitComp = HitResult.GetComponent();
-				if (HitComp)
-				{
-					ECollisionEnabled::Type CollisionType = HitComp->GetCollisionEnabled();
-					if (CollisionType == ECollisionEnabled::QueryAndPhysics || CollisionType == ECollisionEnabled::PhysicsOnly)
-					{
-						break; // Valid collidable surface
-					}
-				}
-
-				// Skip this specific component and trace again
-				if (HitComp)
-				{
-					QueryParams.AddIgnoredComponent(HitComp);
-				}
-				bHit = false;
+				return false;
 			}
 
-			if (bHit)
+			UE_LOG(LogTemp, Log, TEXT("[SnapDiag] single %s deltaZ=%.1f hit=%s"),
+				*Actor->GetName(), DeltaZ,
+				HitResult.GetActor() ? *HitResult.GetActor()->GetName() : TEXT("none"));
+
+			Actor->Modify();
+			Actor->SetActorLocation(Actor->GetActorLocation() + FVector(0, 0, DeltaZ));
+
+			if (bInheritSurfaceRotation)
 			{
-				Actor->Modify();
-
-				FVector NewLocation = ActorLocation;
-				NewLocation.Z = HitResult.ImpactPoint.Z + MeshBottomOffset + 5.0f;
-
-				Actor->SetActorLocation(NewLocation);
-
-				// Align actor rotation to surface normal (inherit slope)
-				// Keep the actor's current facing direction but tilt to match surface
-				FVector SurfaceNormal = HitResult.ImpactNormal;
-				FRotator CurrentRotation = Actor->GetActorRotation();
-
-				// Get actor's current forward direction (on XY plane)
-				FVector CurrentForward = CurrentRotation.Vector();
+				// Keep the actor's facing direction but tilt it to match the surface.
+				const FVector NewUp = HitResult.ImpactNormal;
+				FVector CurrentForward = Actor->GetActorRotation().Vector();
 				CurrentForward.Z = 0;
 				CurrentForward.Normalize();
 
-				// Build a rotation matrix from surface normal and desired forward
-				// NewUp = surface normal
-				// NewForward = project current forward onto the surface plane
-				FVector NewUp = SurfaceNormal;
 				FVector NewRight = FVector::CrossProduct(NewUp, CurrentForward);
 				NewRight.Normalize();
 				FVector NewForward = FVector::CrossProduct(NewRight, NewUp);
 				NewForward.Normalize();
 
-				// Build rotation from these axes
 				FMatrix RotationMatrix = FMatrix::Identity;
 				RotationMatrix.SetAxes(&NewForward, &NewRight, &NewUp);
-				FRotator AlignedRotation = RotationMatrix.Rotator();
-
-				Actor->SetActorRotation(AlignedRotation);
-				Actor->PostEditMove(true);
-
-				NumModified++;
+				Actor->SetActorRotation(RotationMatrix.Rotator());
 			}
-		}
+			else
+			{
+				Actor->SetActorRotation(FRotator::ZeroRotator);
+			}
 
-		if (NumModified > 0)
-		{
+			Actor->PostEditMove(true);
+
+			RefreshEditorPivot(Selection);
 			GEditor->NoteSelectionChange();
 			GEditor->RedrawLevelEditingViewports();
 			return true;
 		}
 
-		return false;
+		// ---- Group / multi-selection: one shared lift, no rotation change -----------
+		// Take the LARGEST required lift so the member sitting on the highest ground defines the
+		// drop; anyone over a dip keeps its relative height instead of being buried.
+		bool bAnyHit = false;
+		float SharedDeltaZ = -FLT_MAX;
+		AActor* DecidingActor = nullptr;
+		AActor* DecidingHit = nullptr;
+
+		TSet<AActor*> IgnoreActors;
+		BuildIgnoreSet(Actors, IgnoreActors);
+
+		for (AActor* Actor : Actors)
+		{
+			float DeltaZ = 0.0f;
+			FHitResult HitResult;
+			if (ComputeGroundDelta(World, Actor, IgnoreActors, DeltaZ, HitResult))
+			{
+				UE_LOG(LogTemp, Log, TEXT("[SnapDiag]   member %s deltaZ=%.1f hit=%s"),
+					*Actor->GetName(), DeltaZ,
+					HitResult.GetActor() ? *HitResult.GetActor()->GetName() : TEXT("none"));
+
+				if (DeltaZ > SharedDeltaZ)
+				{
+					SharedDeltaZ = DeltaZ;
+					DecidingActor = Actor;
+					DecidingHit = HitResult.GetActor();
+				}
+				bAnyHit = true;
+			}
+			else
+			{
+				UE_LOG(LogTemp, Log, TEXT("[SnapDiag]   member %s NO GROUND under it"), *Actor->GetName());
+			}
+		}
+
+		if (!bAnyHit)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[SnapDiag] group of %d: no member found ground, nothing moved"), Actors.Num());
+			return false;
+		}
+
+		// The shared lift is decided by ONE member - whichever needs the biggest lift (i.e. touches
+		// down first on the way down). If a snap refuses to fall, this line names the member that
+		// vetoed it and what it stood on.
+		UE_LOG(LogTemp, Log, TEXT("[SnapDiag] group of %d: sharedDeltaZ=%.1f decided by %s standing on %s"),
+			Actors.Num(), SharedDeltaZ,
+			DecidingActor ? *DecidingActor->GetName() : TEXT("?"),
+			DecidingHit ? *DecidingHit->GetName() : TEXT("?"));
+
+		const FVector Offset(0, 0, SharedDeltaZ);
+		for (AActor* Actor : Actors)
+		{
+			Actor->Modify();
+			Actor->SetActorLocation(Actor->GetActorLocation() + Offset);
+			Actor->PostEditMove(true);
+		}
+
+		RefreshEditorPivot(Selection);
+		GEditor->NoteSelectionChange();
+		GEditor->RedrawLevelEditingViewports();
+		return true;
+	}
+
+	bool SnapSelectedToGround()
+	{
+		return SnapSelectedToGroundInternal(/*bInheritSurfaceRotation*/ true);
 	}
 
 	// Snap to ground WITHOUT inheriting surface rotation (keeps world up)
 	bool SnapSelectedToGroundNoRotation()
 	{
-		if (!GEditor)
-		{
-			return false;
-		}
-
-		USelection* Selection = GEditor->GetSelectedActors();
-		if (!Selection || Selection->Num() == 0)
-		{
-			return false;
-		}
-
-		UWorld* World = GEditor->GetEditorWorldContext().World();
-		if (!World)
-		{
-			return false;
-		}
-
-		// Create undo transaction
-		FScopedTransaction Transaction(FText::FromString(TEXT("Snap to Ground (No Rotation)")));
-
-		int32 NumModified = 0;
-		for (int32 i = 0; i < Selection->Num(); i++)
-		{
-			AActor* Actor = Cast<AActor>(Selection->GetSelectedObject(i));
-			if (!Actor)
-			{
-				continue;
-			}
-
-			FVector ActorLocation = Actor->GetActorLocation();
-
-			// Get mesh component's LOCAL bounds (not affected by animation bloat)
-			float MeshBottomOffset = 0.0f;
-
-			if (USkeletalMeshComponent* SkelMesh = Actor->FindComponentByClass<USkeletalMeshComponent>())
-			{
-				FBoxSphereBounds LocalBounds = SkelMesh->CalcLocalBounds();
-				FVector LocalBottom = FVector(0, 0, LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z);
-				FVector WorldBottom = SkelMesh->GetComponentTransform().TransformPosition(LocalBottom);
-				MeshBottomOffset = ActorLocation.Z - WorldBottom.Z;
-			}
-			else if (UStaticMeshComponent* StaticMesh = Actor->FindComponentByClass<UStaticMeshComponent>())
-			{
-				FBoxSphereBounds LocalBounds = StaticMesh->CalcLocalBounds();
-				FVector LocalBottom = FVector(0, 0, LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z);
-				FVector WorldBottom = StaticMesh->GetComponentTransform().TransformPosition(LocalBottom);
-				MeshBottomOffset = ActorLocation.Z - WorldBottom.Z;
-			}
-			else
-			{
-				// Find first primitive component with blocking collision (skip query-only spheres, triggers, etc.)
-				UPrimitiveComponent* BestComp = nullptr;
-				TArray<UPrimitiveComponent*> PrimComps;
-				Actor->GetComponents<UPrimitiveComponent>(PrimComps);
-				for (UPrimitiveComponent* Comp : PrimComps)
-				{
-					ECollisionEnabled::Type ColType = Comp->GetCollisionEnabled();
-					if (ColType == ECollisionEnabled::QueryAndPhysics || ColType == ECollisionEnabled::PhysicsOnly)
-					{
-						BestComp = Comp;
-						break;
-					}
-				}
-
-				if (BestComp)
-				{
-					FBoxSphereBounds LocalBounds = BestComp->CalcLocalBounds();
-					FVector LocalBottom = FVector(0, 0, LocalBounds.Origin.Z - LocalBounds.BoxExtent.Z);
-					FVector WorldBottom = BestComp->GetComponentTransform().TransformPosition(LocalBottom);
-					MeshBottomOffset = ActorLocation.Z - WorldBottom.Z;
-				}
-				// else: no physics collision component, use 0 offset (root = ground)
-			}
-
-			// Line trace from actor position downward
-			FVector TraceStart = ActorLocation + FVector(0, 0, 500.f);
-			FVector TraceEnd = TraceStart - FVector(0, 0, 200000.f);
-
-			FCollisionQueryParams QueryParams;
-			QueryParams.AddIgnoredActor(Actor);
-
-			// Recursively ignore all attached actors
-			TArray<AActor*> AttachedActors;
-			Actor->GetAttachedActors(AttachedActors, true, true);
-			for (AActor* Attached : AttachedActors)
-			{
-				QueryParams.AddIgnoredActor(Attached);
-			}
-
-			FHitResult HitResult;
-			bool bHit = false;
-
-			// Use channel trace (ECC_Visibility) - respects collision responses,
-			// so query-only/overlap components are automatically skipped
-			for (int32 Attempt = 0; Attempt < 50; Attempt++)
-			{
-				bHit = World->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, ECC_Visibility, QueryParams);
-				if (!bHit)
-				{
-					break;
-				}
-
-				// Also skip components with query-only collision (blocks Visibility but no physics)
-				UPrimitiveComponent* HitComp = HitResult.GetComponent();
-				if (HitComp)
-				{
-					ECollisionEnabled::Type CollisionType = HitComp->GetCollisionEnabled();
-					if (CollisionType == ECollisionEnabled::QueryAndPhysics || CollisionType == ECollisionEnabled::PhysicsOnly)
-					{
-						break; // Valid collidable surface
-					}
-				}
-
-				// Skip this specific component and trace again
-				if (HitComp)
-				{
-					QueryParams.AddIgnoredComponent(HitComp);
-				}
-				bHit = false;
-			}
-
-			if (bHit)
-			{
-				Actor->Modify();
-
-				FVector NewLocation = ActorLocation;
-				NewLocation.Z = HitResult.ImpactPoint.Z + MeshBottomOffset + 5.0f;
-
-				Actor->SetActorLocation(NewLocation);
-				// Reset rotation to 0,0,0 (world up, no rotation)
-				Actor->SetActorRotation(FRotator::ZeroRotator);
-				Actor->PostEditMove(true);
-
-				NumModified++;
-			}
-		}
-
-		if (NumModified > 0)
-		{
-			GEditor->NoteSelectionChange();
-			GEditor->RedrawLevelEditingViewports();
-			return true;
-		}
-
-		return false;
+		return SnapSelectedToGroundInternal(/*bInheritSurfaceRotation*/ false);
 	}
 
 	bool DuplicateInPlace()

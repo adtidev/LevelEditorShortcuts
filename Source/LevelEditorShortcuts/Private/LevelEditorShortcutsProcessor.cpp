@@ -8,6 +8,9 @@
 // G tap: Toggle grid snapping on/off
 // G+Scroll: Change grid snap size (when not in Landscape/Foliage modes)
 // J tap: Toggle Game View (hide editor shapes/icons/volumes)
+// N tap: Snap selection to camera, group-safe (rigid move, no formation collapse)
+// Shift+F: Toggle lock/unlock on the selected group(s)
+// Shift+G: Toggle group/ungroup on the selection
 
 #include "CoreMinimal.h"
 #include "Framework/Application/IInputProcessor.h"
@@ -26,6 +29,7 @@
 #include "UnrealWidget.h"
 #include "SceneView.h"
 #include "Editor/GroupActor.h"
+#include "ActorGroupingUtils.h"
 #include "Editor/UnrealEdEngine.h"
 #include "UnrealEdGlobals.h"  // GUnrealEd
 
@@ -56,6 +60,12 @@ public:
 	{
 		// Cache cursor for visibility control from key handlers
 		CachedCursor = Cursor;
+
+		if (bPendingGridToggle && !IsUnsafeForEditorCommands())
+		{
+			bPendingGridToggle = false;
+			ToggleGridSnap();
+		}
 
 		// Don't process during Play In Editor
 		if (GEditor && GEditor->IsPlaySessionInProgress())
@@ -168,6 +178,22 @@ public:
 			bGScrolledWhileDown = false;
 		}
 
+		// Shift+G — toggle group / ungroup on the selection: one key for both.
+		// Overrides the stock Shift+G (Ungroup).
+		if (Key == EKeys::G
+			&& InKeyEvent.IsShiftDown()
+			&& !InKeyEvent.IsAltDown()
+			&& !InKeyEvent.IsControlDown()
+			&& !InKeyEvent.IsRepeat()
+			&& IsLevelEditorViewportFocused())
+		{
+			if (ToggleSelectionGrouped())
+			{
+				bGScrolledWhileDown = true; // suppress the G-release grid-snap toggle
+				return true;
+			}
+		}
+
 		// J tap: Toggle Game View (hide editor shapes/icons/volumes)
 		if (Key == EKeys::J && !InKeyEvent.IsRepeat())
 		{
@@ -220,6 +246,21 @@ public:
 			}
 		}
 
+		// Shift+F — toggle lock on the selected group(s): one key for both Lock and Unlock.
+		// Overrides the stock Shift+F (Frame Selected in All Viewports) when a group is selected.
+		if (Key == EKeys::F
+			&& InKeyEvent.IsShiftDown()
+			&& !InKeyEvent.IsControlDown()
+			&& !InKeyEvent.IsAltDown()
+			&& !InKeyEvent.IsRepeat()
+			&& IsLevelEditorViewportFocused())
+		{
+			if (ToggleSelectedGroupLock())
+			{
+				return true;
+			}
+		}
+
 		// Shift+4 — toggle/invoke the Lock Browser tab (works from anywhere in editor).
 		if (Key == EKeys::Four
 			&& InKeyEvent.IsShiftDown()
@@ -252,6 +293,16 @@ public:
 				{
 					GLevelEditorModeTools().SetWidgetMode(UE::Widget::WM_Scale);
 					return true;
+				}
+
+				// N tap: group-safe "snap to camera". Replaces the stock LevelEditor
+				// SnapObjectToCamera command, which scatters groups (see the helper below).
+				if (Key == EKeys::N && !InKeyEvent.IsRepeat())
+				{
+					if (SnapSelectionToCameraRigid())
+					{
+						return true; // Consume N so the engine command doesn't also run
+					}
 				}
 			}
 		}
@@ -442,11 +493,27 @@ private:
 	float TotalScaleDelta = 0.0f;
 	TArray<TPair<TWeakObjectPtr<AActor>, FVector>> ScaleDragInitialScales;
 
+	// Actors moved/scaled during the current drag. Each frame only gets PostEditMove(false); the
+	// final PostEditMove(true) is what broadcasts GEngine->OnActorMoved, and UFoliageEditorSubsystem
+	// only drags painted foliage along with its base on that broadcast. Without it, foliage stayed
+	// behind on Q/E/R drags while the gizmo (which finishes its move) carried it correctly.
+	TSet<TWeakObjectPtr<AActor>> DragTouchedActors;
+
 	// Transaction for continuous drag operations (single undo for entire drag)
 	TUniquePtr<FScopedTransaction> DragTransaction;
 
 	void EndDragTransaction()
 	{
+		// Finish the move while the transaction is still open so foliage moves land in the same undo.
+		for (const TWeakObjectPtr<AActor>& Weak : DragTouchedActors)
+		{
+			if (AActor* Actor = Weak.Get())
+			{
+				Actor->PostEditMove(true);
+			}
+		}
+		DragTouchedActors.Empty();
+
 		if (DragTransaction.IsValid())
 		{
 			DragTransaction.Reset();
@@ -585,6 +652,187 @@ private:
 		{
 			GUnrealEd->UpdatePivotLocationForSelection();
 		}
+	}
+
+	// N: snap the selection to the camera WITHOUT scattering groups.
+	//
+	// The stock LevelEditor command bound to N (SnapObjectToCamera / "Snap Object to View",
+	// Engine LevelEditorActions.cpp: FLevelEditorActionCallbacks::SnapObjectToView_Clicked)
+	// loops over every selected element and slams each one to the IDENTICAL camera location and
+	// rotation. Select a group and every member collapses onto a single point wearing the camera's
+	// rotation - the formation is gone. Same for any plain multi-selection.
+	//
+	// We move the selection RIGIDLY instead: take the delta from the selection's centroid to the
+	// camera and add it to every actor. Relative offsets and each actor's own rotation survive.
+	// A single actor keeps the engine's behaviour (location AND rotation take the camera's), so
+	// the everyday one-object case is unchanged.
+	//
+	// GetActorsToTransform() does the group bookkeeping: it drops the passive AGroupActor container
+	// and any actor whose selected ancestor already carries it via attachment, so nothing is moved
+	// twice. RefreshEditorPivot() re-centres a locked group's root and the gizmo afterwards.
+	// Shift+F: if any group the selection touches is unlocked, lock; otherwise unlock.
+	// After an unlock the selection is usually a single member, whose parent group is now
+	// unlocked -> the next press locks it again. Returns false (key not consumed) if the
+	// selection touches no group, so Shift+F keeps its stock behaviour on ungrouped actors.
+	bool ToggleSelectedGroupLock()
+	{
+		if (!GEditor || !UActorGroupingUtils::IsGroupingActive())
+		{
+			return false;
+		}
+
+		bool bAnyGroup = false;
+		bool bAnyUnlocked = false;
+		for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+		{
+			AActor* Actor = Cast<AActor>(*It);
+			if (!Actor)
+			{
+				continue;
+			}
+			AGroupActor* Group = Cast<AGroupActor>(Actor);
+			if (!Group)
+			{
+				// GetParentForActor isn't exported from UnrealEd; the root is what Lock/Unlock act on anyway.
+				Group = AGroupActor::GetRootForActor(Actor);
+			}
+			if (Group)
+			{
+				bAnyGroup = true;
+				bAnyUnlocked |= !Group->IsLocked();
+			}
+		}
+
+		if (!bAnyGroup)
+		{
+			return false;
+		}
+
+		if (bAnyUnlocked)
+		{
+			UActorGroupingUtils::Get()->LockSelectedGroups();
+		}
+		else
+		{
+			UActorGroupingUtils::Get()->UnlockSelectedGroups();
+		}
+		GEditor->RedrawLevelEditingViewports();
+		return true;
+	}
+
+	// Shift+G: if the whole selection is already one group, ungroup it; otherwise group the
+	// selection (GroupSelected pulls actors out of any old groups and makes one new locked group).
+	// Returns false (key not consumed) when there's nothing to do, e.g. a single ungrouped actor.
+	bool ToggleSelectionGrouped()
+	{
+		if (!GEditor || !UActorGroupingUtils::IsGroupingActive())
+		{
+			return false;
+		}
+
+		TSet<AGroupActor*> Roots;
+		int32 NumMembers = 0;
+		bool bAnyUngrouped = false;
+		for (FSelectionIterator It(GEditor->GetSelectedActorIterator()); It; ++It)
+		{
+			AActor* Actor = Cast<AActor>(*It);
+			if (!Actor || Actor->IsA(AGroupActor::StaticClass()))
+			{
+				continue; // group containers ride along with their members
+			}
+			++NumMembers;
+			if (AGroupActor* Root = AGroupActor::GetRootForActor(Actor))
+			{
+				Roots.Add(Root);
+			}
+			else
+			{
+				bAnyUngrouped = true;
+			}
+		}
+
+		if (NumMembers == 0)
+		{
+			return false;
+		}
+
+		if (!bAnyUngrouped && Roots.Num() == 1)
+		{
+			UActorGroupingUtils::Get()->UngroupSelected();
+		}
+		else
+		{
+			if (NumMembers < 2 || !UActorGroupingUtils::Get()->CanGroupSelectedActors())
+			{
+				return false;
+			}
+			UActorGroupingUtils::Get()->GroupSelected();
+		}
+		GEditor->NoteSelectionChange();
+		GEditor->RedrawLevelEditingViewports();
+		return true;
+	}
+
+	bool SnapSelectionToCameraRigid()
+	{
+		if (!GEditor)
+		{
+			return false;
+		}
+
+		USelection* Selection = GEditor->GetSelectedActors();
+		if (!Selection || Selection->Num() == 0)
+		{
+			return false;
+		}
+
+		FLevelEditorViewportClient* ViewportClient = GetActiveViewportClient();
+		if (!ViewportClient)
+		{
+			return false;
+		}
+
+		TArray<AActor*> Actors;
+		GetActorsToTransform(Selection, Actors);
+		if (Actors.Num() == 0)
+		{
+			return false;
+		}
+
+		const FVector CameraLocation = ViewportClient->GetViewLocation();
+		const FRotator CameraRotation = ViewportClient->GetViewRotation();
+
+		FScopedTransaction Transaction(FText::FromString(TEXT("Snap Selection to Camera")));
+
+		if (Actors.Num() == 1)
+		{
+			AActor* Actor = Actors[0];
+			Actor->Modify();
+			Actor->SetActorLocation(CameraLocation);
+			Actor->SetActorRotation(CameraRotation);
+			Actor->PostEditMove(true);
+		}
+		else
+		{
+			FVector Centroid = FVector::ZeroVector;
+			for (AActor* Actor : Actors)
+			{
+				Centroid += Actor->GetActorLocation();
+			}
+			Centroid /= (double)Actors.Num();
+
+			const FVector Delta = CameraLocation - Centroid;
+			for (AActor* Actor : Actors)
+			{
+				Actor->Modify();
+				Actor->SetActorLocation(Actor->GetActorLocation() + Delta);
+				Actor->PostEditMove(true);
+			}
+		}
+
+		RefreshEditorPivot(Selection);
+		GEditor->RedrawLevelEditingViewports();
+		return true;
 	}
 
 	// Project screen position to world position on a horizontal plane at given Z
@@ -807,6 +1055,7 @@ private:
 			FVector NewLocation = Actor->GetActorLocation() + ActualDelta;
 			Actor->SetActorLocation(NewLocation);
 			Actor->PostEditMove(false);
+			DragTouchedActors.Add(Actor);
 		}
 
 		RefreshEditorPivot(Selection);
@@ -928,6 +1177,7 @@ private:
 			FVector NewLocation = Actor->GetActorLocation() + ActualDelta;
 			Actor->SetActorLocation(NewLocation);
 			Actor->PostEditMove(false);
+			DragTouchedActors.Add(Actor);
 		}
 
 		RefreshEditorPivot(Selection);
@@ -1001,6 +1251,7 @@ private:
 			NewScale = NewScale.ComponentMax(FVector(0.001f));
 			Actor->SetActorScale3D(NewScale);
 			Actor->PostEditMove(false);
+			DragTouchedActors.Add(Actor);
 		}
 
 		GEditor->NoteSelectionChange();
@@ -1132,8 +1383,25 @@ private:
 		GEditor->RedrawLevelEditingViewports();
 	}
 
+	// Slate keeps pumping input while a package is being saved (autosave progress dialog), and the
+	// grid toggle Execs "MODE GRID=..." which calls StaticFindObjectFast -> fatal "Illegal call to
+	// StaticFindObjectFast() while serializing object data!" (editor died 2026-11-05 on a G tap
+	// mid-autosave). Never run editor commands then - queue and replay from Tick.
+	static bool IsUnsafeForEditorCommands()
+	{
+		return UE::IsSavingPackage(nullptr) || IsGarbageCollecting();
+	}
+
+	bool bPendingGridToggle = false;
+
 	void ToggleGridSnap()
 	{
+		if (IsUnsafeForEditorCommands())
+		{
+			bPendingGridToggle = !bPendingGridToggle; // two taps mid-save cancel out
+			return;
+		}
+
 		// Use the built-in toggle which handles all the proper notifications
 		FLevelEditorActionCallbacks::LocationGridSnap_Clicked();
 
